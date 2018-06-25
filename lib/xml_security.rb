@@ -29,6 +29,7 @@ require "openssl"
 require 'nokogiri'
 require "digest/sha1"
 require "digest/sha2"
+require "onelogin/ruby-saml/utils"
 require "onelogin/ruby-saml/error_handling"
 
 module XMLSecurity
@@ -90,7 +91,7 @@ module XMLSecurity
     ENVELOPED_SIG   = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
     INC_PREFIX_LIST = "#default samlp saml ds xs xsi md"
 
-    attr_accessor :uuid
+    attr_writer :uuid
 
     def uuid
       @uuid ||= begin
@@ -186,7 +187,7 @@ module XMLSecurity
   class SignedDocument < BaseDocument
     include OneLogin::RubySaml::ErrorHandling
 
-    attr_accessor :signed_element_id
+    attr_writer :signed_element_id
 
     def initialize(response, errors = [])
       super(response)
@@ -206,11 +207,11 @@ module XMLSecurity
       )
 
       if cert_element
-        base64_cert = cert_element.text
+        base64_cert = OneLogin::RubySaml::Utils.element_text(cert_element)
         cert_text = Base64.decode64(base64_cert)
         begin
           cert = OpenSSL::X509::Certificate.new(cert_text)
-        rescue OpenSSL::X509::CertificateError => e
+        rescue OpenSSL::X509::CertificateError => _e
           return append_error("Certificate Error", soft)
         end
 
@@ -249,11 +250,11 @@ module XMLSecurity
       )
 
       if cert_element
-        base64_cert = cert_element.text
+        base64_cert = OneLogin::RubySaml::Utils.element_text(cert_element)
         cert_text = Base64.decode64(base64_cert)
         begin
           cert = OpenSSL::X509::Certificate.new(cert_text)
-        rescue OpenSSL::X509::CertificateError => e
+        rescue OpenSSL::X509::CertificateError => _e
           return append_error("Certificate Error", soft)
         end
 
@@ -296,8 +297,8 @@ module XMLSecurity
         sig_element,
         "./ds:SignatureValue",
         {"ds" => DSIG}
-      ).text
-      signature = Base64.decode64(base64_signature)
+      )
+      signature = Base64.decode64(OneLogin::RubySaml::Utils.element_text(base64_signature))
 
       # canonicalization method
       canon_algorithm = canon_algorithm REXML::XPath.first(
@@ -317,10 +318,9 @@ module XMLSecurity
 
       # check digests
       ref = REXML::XPath.first(sig_element, "//ds:Reference", {"ds"=>DSIG})
-      uri = ref.attributes.get_attribute("URI").value
 
       hashed_element = document.at_xpath("//*[@ID=$id]", nil, { 'id' => extract_signed_element_id })
-      
+
       canon_algorithm = canon_algorithm REXML::XPath.first(
         ref,
         '//ds:CanonicalizationMethod',
@@ -338,8 +338,8 @@ module XMLSecurity
         ref,
         "//ds:DigestValue",
         { "ds" => DSIG }
-      ).text
-      digest_value = Base64.decode64(encoded_digest_value)
+      )
+      digest_value = Base64.decode64(OneLogin::RubySaml::Utils.element_text(encoded_digest_value))
 
       unless digests_match?(hash, digest_value)
         @errors << "Digest mismatch"

@@ -1,5 +1,12 @@
 # Ruby SAML [![Build Status](https://secure.travis-ci.org/onelogin/ruby-saml.svg)](http://travis-ci.org/onelogin/ruby-saml) [![Coverage Status](https://coveralls.io/repos/onelogin/ruby-saml/badge.svg?branch=master%0A)](https://coveralls.io/r/onelogin/ruby-saml?branch=master%0A) [![Gem Version](https://badge.fury.io/rb/ruby-saml.svg)](http://badge.fury.io/rb/ruby-saml)
 
+## Updating from 1.7.X to 1.8.0
+On Version `1.8.0`, creating AuthRequests/LogoutRequests/LogoutResponses with nil RelayState param will not generate a URL with an empty RelayState parameter anymore. It also changes the invalid audience error message.
+
+## Updating from 1.6.0 to 1.7.0
+
+Version `1.7.0` is a recommended update for all Ruby SAML users as it includes a fix for the [CVE-2017-11428](https://www.cvedetails.com/cve/CVE-2017-11428/) vulnerability.
+
 ## Updating from 1.5.0 to 1.6.0
 
 Version `1.6.0` changes the preferred way to construct instances of `Logoutresponse` and `SloLogoutrequest`. Previously the _SAMLResponse_, _RelayState_, and _SigAlg_ parameters of these message types were provided via the constructor's `options[:get_params]` parameter. Unfortunately this can result in incompatibility with other SAML implementations; signatures are specified to be computed based on the _sender's_ URI-encoding of the message, which can differ from that of Ruby SAML. In particular, Ruby SAML's URI-encoding does not match that of Microsoft ADFS, so messages from ADFS can fail signature validation.
@@ -36,6 +43,10 @@ The 'Recipient' value is compared with the settings.assertion_consumer_service_u
 value.
 If you want to skip that validation, add the :skip_recipient_check option to the
 initialize method of the Response object.
+
+Parsing metadata that contains more than one certificate will propagate the
+idp_cert_multi property rather than idp_cert. See [signature validation
+section](#signature-validation) for details.
 
 ## Updating from 1.3.x to 1.4.X
 
@@ -231,9 +242,10 @@ def saml_settings
 end
 ```
 
-Some assertion validations can be skipped by passing parameters to `OneLogin::RubySaml::Response.new()`.  For example, you can skip the `Conditions`, `Recipient`, or the `SubjectConfirmation` validations by initializing the response with different options:
+Some assertion validations can be skipped by passing parameters to `OneLogin::RubySaml::Response.new()`.  For example, you can skip the `AuthnStatement`, `Conditions`, `Recipient`, or the `SubjectConfirmation` validations by initializing the response with different options:
 
 ```ruby
+response = OneLogin::RubySaml::Response.new(params[:SAMLResponse], {skip_authnstatement: true}) # skips AuthnStatement
 response = OneLogin::RubySaml::Response.new(params[:SAMLResponse], {skip_conditions: true}) # skips conditions
 response = OneLogin::RubySaml::Response.new(params[:SAMLResponse], {skip_subject_confirmation: true}) # skips subject confirmation
 response = OneLogin::RubySaml::Response.new(params[:SAMLResponse], {skip_recipient_check: true}) # doens't skip subject confirmation, but skips the recipient check which is a sub check of the subject_confirmation check

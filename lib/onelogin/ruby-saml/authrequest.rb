@@ -36,6 +36,7 @@ module OneLogin
         params.each_pair do |key, value|
           request_params << "&#{key.to_s}=#{CGI.escape(value.to_s)}"
         end
+        raise "Invalid settings, idp_sso_target_url is not set!" if settings.idp_sso_target_url.nil?
         @login_url = settings.idp_sso_target_url + request_params
       end
 
@@ -49,6 +50,11 @@ module OneLogin
         # Based on the HashWithIndifferentAccess value in Rails we could experience
         # conflicts so this line will solve them.
         relay_state = params[:RelayState] || params['RelayState']
+
+        if relay_state.nil?
+          params.delete(:RelayState)
+          params.delete('RelayState')
+        end
 
         request_doc = create_authentication_xml_doc(settings)
         request_doc.context[:attribute_quote] = :quote if settings.double_quote_xml_attribute_values
@@ -157,7 +163,7 @@ module OneLogin
 
       def sign_document(document, settings)
         # embed signature
-        if settings.security[:authn_requests_signed] && settings.private_key && settings.certificate && settings.security[:embed_sign] 
+        if settings.security[:authn_requests_signed] && settings.private_key && settings.certificate && settings.security[:embed_sign]
           private_key = settings.get_sp_key
           cert = settings.get_sp_cert
           document.sign_document(private_key, cert, settings.security[:signature_method], settings.security[:digest_method])

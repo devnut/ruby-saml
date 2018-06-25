@@ -1,5 +1,23 @@
 # RubySaml Changelog
 
+### 1.8.0 (April 23, 2018)
+* [#437](https://github.com/onelogin/ruby-saml/issues/437) Creating AuthRequests/LogoutRequests/LogoutResponses with nil RelayState should not send empty RelayState URL param
+* [#454](https://github.com/onelogin/ruby-saml/pull/454) Added Response available options
+* [#453](https://github.com/onelogin/ruby-saml/pull/453) Raise a more descriptive exception if idp_sso_target_url is missing
+* [#452](https://github.com/onelogin/ruby-saml/pull/452) Fix behavior of skip_conditions flag on Response
+* [#449](https://github.com/onelogin/ruby-saml/pull/449) Add ability to skip authnstatement validation
+* Clear cached values to be able to use IdpMetadataParser more than once
+* Updated invalid audience error message
+
+### 1.7.2 (Feb 28, 2018)
+* [#446](https://github.com/onelogin/ruby-saml/pull/446) Normalize text returned by OneLogin::RubySaml::Utils.element_text
+
+### 1.7.1 (Feb 28, 2018)
+* [#444](https://github.com/onelogin/ruby-saml/pull/444) Fix audience validation for empty audience restriction
+
+### 1.7.0 (Feb 27, 2018)
+* Fix vulnerability CVE-2017-11428. Process text of nodes properly, ignoring comments
+
 ### 1.6.1 (January 15, 2018)
 * [#428](https://github.com/onelogin/ruby-saml/issues/428) Fix a bug on IdPMetadataParser when parsing certificates
 * [#426](https://github.com/onelogin/ruby-saml/pull/426) Ensure `Rails` responds to `logger`
