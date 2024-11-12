@@ -1,6 +1,7 @@
 require "onelogin/ruby-saml/logging"
 require "onelogin/ruby-saml/saml_message"
 require "onelogin/ruby-saml/utils"
+require "onelogin/ruby-saml/setting_error"
 
 # Only supports SAML 2.0
 module OneLogin
@@ -11,13 +12,17 @@ module OneLogin
     class Logoutrequest < SamlMessage
 
       # Logout Request ID
-      attr_reader :uuid
+      attr_accessor :uuid
 
       # Initializes the Logout Request. A Logoutrequest Object that is an extension of the SamlMessage class.
       # Asigns an ID, a random uuid.
       #
       def initialize
         @uuid = OneLogin::RubySaml::Utils.uuid
+      end
+
+      def request_id
+        @uuid
       end
 
       # Creates the Logout Request string.
@@ -27,13 +32,14 @@ module OneLogin
       #
       def create(settings, params={})
         params = create_params(settings, params)
-        params_prefix = (settings.idp_slo_target_url =~ /\?/) ? '&' : '?'
+        params_prefix = (settings.idp_slo_service_url =~ /\?/) ? '&' : '?'
         saml_request = CGI.escape(params.delete("SAMLRequest"))
         request_params = "#{params_prefix}SAMLRequest=#{saml_request}"
         params.each_pair do |key, value|
-          request_params << "&#{key.to_s}=#{CGI.escape(value.to_s)}"
+          request_params << "&#{key}=#{CGI.escape(value.to_s)}"
         end
-        @logout_url = settings.idp_slo_target_url + request_params
+        raise SettingError.new "Invalid settings, idp_slo_service_url is not set!" if settings.idp_slo_service_url.nil? or settings.idp_slo_service_url.empty?
+        @logout_url = settings.idp_slo_service_url + request_params
       end
 
       # Creates the Get parameters for the logout request.
@@ -63,9 +69,10 @@ module OneLogin
         request = deflate(request) if settings.compress_request
         base64_request = encode(request)
         request_params = {"SAMLRequest" => base64_request}
+        sp_signing_key = settings.get_sp_signing_key
 
-        if settings.security[:logout_requests_signed] && !settings.security[:embed_sign] && settings.private_key
-          params['SigAlg']    = settings.security[:signature_method]
+        if settings.idp_slo_service_binding == Utils::BINDINGS[:redirect] && settings.security[:logout_requests_signed] && sp_signing_key
+          params['SigAlg'] = settings.security[:signature_method]
           url_string = OneLogin::RubySaml::Utils.build_query(
             :type => 'SAMLRequest',
             :data => base64_request,
@@ -73,7 +80,7 @@ module OneLogin
             :sig_alg => params['SigAlg']
           )
           sign_algorithm = XMLSecurity::BaseDocument.new.algorithm(settings.security[:signature_method])
-          signature = settings.get_sp_key.sign(sign_algorithm.new, url_string)
+          signature = settings.get_sp_signing_key.sign(sign_algorithm.new, url_string)
           params['Signature'] = encode(signature)
         end
 
@@ -89,6 +96,11 @@ module OneLogin
       # @return [String] The SAMLRequest String.
       #
       def create_logout_request_xml_doc(settings)
+        document = create_xml_document(settings)
+        sign_document(document, settings)
+      end
+
+      def create_xml_document(settings)
         time = Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         request_doc = XMLSecurity::Document.new
@@ -98,11 +110,11 @@ module OneLogin
         root.attributes['ID'] = uuid
         root.attributes['IssueInstant'] = time
         root.attributes['Version'] = "2.0"
-        root.attributes['Destination'] = settings.idp_slo_target_url  unless settings.idp_slo_target_url.nil?
+        root.attributes['Destination'] = settings.idp_slo_service_url  unless settings.idp_slo_service_url.nil? or settings.idp_slo_service_url.empty?
 
-        if settings.issuer
+        if settings.sp_entity_id
           issuer = root.add_element "saml:Issuer"
-          issuer.text = settings.issuer
+          issuer.text = settings.sp_entity_id
         end
 
         nameid = root.add_element "saml:NameID"
@@ -122,14 +134,17 @@ module OneLogin
           sessionindex.text = settings.sessionindex
         end
 
+        request_doc
+      end
+
+      def sign_document(document, settings)
         # embed signature
-        if settings.security[:logout_requests_signed] && settings.private_key && settings.certificate && settings.security[:embed_sign]
-          private_key = settings.get_sp_key
-          cert = settings.get_sp_cert
-          request_doc.sign_document(private_key, cert, settings.security[:signature_method], settings.security[:digest_method])
+        cert, private_key = settings.get_sp_signing_pair
+        if settings.idp_slo_service_binding == Utils::BINDINGS[:post] && settings.security[:logout_requests_signed] && private_key && cert
+          document.sign_document(private_key, cert, settings.security[:signature_method], settings.security[:digest_method])
         end
 
-        request_doc
+        document
       end
     end
   end

@@ -43,8 +43,12 @@ module OneLogin
           end
         end
 
-        @request = decode_raw_saml(request)
+        @request = decode_raw_saml(request, settings)
         @document = REXML::Document.new(@request)
+      end
+
+      def request_id
+        id(document)
       end
 
       # Validates the Logout Request with the default values (soft = true)
@@ -58,10 +62,7 @@ module OneLogin
       # @return [String] Gets the NameID of the Logout Request.
       #
       def name_id
-        @name_id ||= begin
-          node = REXML::XPath.first(document, "/p:LogoutRequest/a:NameID", { "p" => PROTOCOL, "a" => ASSERTION })
-          Utils.element_text(node)
-        end
+        @name_id ||= Utils.element_text(name_id_node)
       end
 
       alias_method :nameid, :name_id
@@ -69,14 +70,48 @@ module OneLogin
       # @return [String] Gets the NameID Format of the Logout Request.
       #
       def name_id_format
-        @name_id_node ||= REXML::XPath.first(document, "/p:LogoutRequest/a:NameID", { "p" => PROTOCOL, "a" => ASSERTION })
         @name_id_format ||=
-          if @name_id_node && @name_id_node.attribute("Format")
-            @name_id_node.attribute("Format").value
+          if name_id_node && name_id_node.attribute("Format")
+            name_id_node.attribute("Format").value
           end
       end
 
       alias_method :nameid_format, :name_id_format
+
+      def name_id_node
+        @name_id_node ||=
+          begin
+            encrypted_node = REXML::XPath.first(document, "/p:LogoutRequest/a:EncryptedID", { "p" => PROTOCOL, "a" => ASSERTION })
+            if encrypted_node
+              node = decrypt_nameid(encrypted_node)
+            else
+              node = REXML::XPath.first(document, "/p:LogoutRequest/a:NameID", { "p" => PROTOCOL, "a" => ASSERTION })
+            end
+          end
+      end
+
+      # Decrypts an EncryptedID element
+      # @param encrypted_id_node [REXML::Element] The EncryptedID element
+      # @return [REXML::Document] The decrypted EncrypedtID element
+      #
+      def decrypt_nameid(encrypted_id_node)
+
+        if settings.nil? || settings.get_sp_decryption_keys.empty?
+          raise ValidationError.new('An ' + encrypted_id_node.name + ' found and no SP private key found on the settings to decrypt it')
+        end
+
+        elem_plaintext = OneLogin::RubySaml::Utils.decrypt_multi(encrypted_id_node, settings.get_sp_decryption_keys)
+        # If we get some problematic noise in the plaintext after decrypting.
+        # This quick regexp parse will grab only the Element and discard the noise.
+        elem_plaintext = elem_plaintext.match(/(.*<\/(\w+:)?NameID>)/m)[0]
+
+        # To avoid namespace errors if saml namespace is not defined
+        # create a parent node first with the namespace defined
+        node_header = '<node xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">'
+        elem_plaintext = node_header + elem_plaintext + '</node>'
+        doc = REXML::Document.new(elem_plaintext)
+        doc.root[0]
+      end
 
       # @return [String|nil] Gets the ID attribute from the Logout Request. if exists.
       #
@@ -125,6 +160,12 @@ module OneLogin
       end
 
       private
+
+      # returns the allowed clock drift on timing validation
+      # @return [Float]
+      def allowed_clock_drift
+        options[:allowed_clock_drift].to_f.abs + Float::EPSILON
+      end
 
       # Hard aux function to validate the Logout Request
       # @param collect_errors [Boolean] Stop validation when first error appears or keep validating. (if soft=true)
@@ -176,15 +217,17 @@ module OneLogin
         true
       end
 
-      # Validates the time. (If the logout request was initialized with the :allowed_clock_drift option, the timing validations are relaxed by the allowed_clock_drift value)
+      # Validates the time. (If the logout request was initialized with the :allowed_clock_drift
+      # option, the timing validations are relaxed by the allowed_clock_drift value)
       # If fails, the error is added to the errors array
       # @return [Boolean] True if satisfies the conditions, otherwise False if soft=True
       # @raise [ValidationError] if soft == false and validation fails
       #
       def validate_not_on_or_after
         now = Time.now.utc
-        if not_on_or_after && now >= (not_on_or_after + (options[:allowed_clock_drift] || 0))
-          return append_error("Current time is on or after NotOnOrAfter (#{now} >= #{not_on_or_after})")
+
+        if not_on_or_after && now >= (not_on_or_after + allowed_clock_drift)
+          return append_error("Current time is on or after NotOnOrAfter (#{now} >= #{not_on_or_after}#{" + #{allowed_clock_drift.ceil}s" if allowed_clock_drift > 0})")
         end
 
         true
@@ -236,32 +279,8 @@ module OneLogin
         return true unless options.has_key? :get_params
         return true unless options[:get_params].has_key? 'Signature'
 
-        # SAML specifies that the signature should be derived from a concatenation
-        # of URI-encoded values _as sent by the IDP_:
-        #
-        # > Further, note that URL-encoding is not canonical; that is, there are multiple legal encodings for a given
-        # > value. The relying party MUST therefore perform the verification step using the original URL-encoded
-        # > values it received on the query string. It is not sufficient to re-encode the parameters after they have been
-        # > processed by software because the resulting encoding may not match the signer's encoding.
-        #
-        # <http://docs.oasis-open.org/security/saml/v2.0/saml-bindings-2.0-os.pdf>
-        #
-        # If we don't have the original parts (for backward compatibility) required to correctly verify the signature,
-        # then fabricate them by re-encoding the parsed URI parameters, and hope that we're lucky enough to use
-        # the exact same URI-encoding as the IDP. (This is not the case if the IDP is ADFS!)
-        options[:raw_get_params] ||= {}
-        if options[:raw_get_params]['SAMLRequest'].nil? && !options[:get_params]['SAMLRequest'].nil?
-          options[:raw_get_params]['SAMLRequest'] = CGI.escape(options[:get_params]['SAMLRequest'])
-        end
-        if options[:raw_get_params]['RelayState'].nil? && !options[:get_params]['RelayState'].nil?
-          options[:raw_get_params]['RelayState'] = CGI.escape(options[:get_params]['RelayState'])
-        end
-        if options[:raw_get_params]['SigAlg'].nil? && !options[:get_params]['SigAlg'].nil?
-          options[:raw_get_params]['SigAlg'] = CGI.escape(options[:get_params]['SigAlg'])
-        end
+        options[:raw_get_params] = OneLogin::RubySaml::Utils.prepare_raw_get_params(options[:raw_get_params], options[:get_params], settings.security[:lowercase_url_encoding])
 
-        # If we only received the raw version of SigAlg,
-        # then parse it back into the decoded params hash for convenience.
         if options[:get_params]['SigAlg'].nil? && !options[:raw_get_params]['SigAlg'].nil?
           options[:get_params]['SigAlg'] = CGI.unescape(options[:raw_get_params]['SigAlg'])
         end
@@ -280,13 +299,19 @@ module OneLogin
           :raw_sig_alg     => options[:raw_get_params]['SigAlg']
         )
 
+        expired = false
         if idp_certs.nil? || idp_certs[:signing].empty?
           valid = OneLogin::RubySaml::Utils.verify_signature(
-            :cert         => settings.get_idp_cert,
+            :cert         => idp_cert,
             :sig_alg      => options[:get_params]['SigAlg'],
             :signature    => options[:get_params]['Signature'],
             :query_string => query_string
           )
+          if valid && settings.security[:check_idp_cert_expiration]
+            if OneLogin::RubySaml::Utils.is_cert_expired(idp_cert)
+              expired = true
+            end
+          end
         else
           valid = false
           idp_certs[:signing].each do |signing_idp_cert|
@@ -297,18 +322,26 @@ module OneLogin
               :query_string => query_string
             )
             if valid
+              if settings.security[:check_idp_cert_expiration]
+                if OneLogin::RubySaml::Utils.is_cert_expired(signing_idp_cert)
+                  expired = true
+                end
+              end
               break
             end
           end
         end
 
+        if expired
+          error_msg = "IdP x509 certificate expired"
+          return append_error(error_msg)
+        end
         unless valid
           return append_error("Invalid Signature on Logout Request")
         end
 
         true
       end
-
     end
   end
 end

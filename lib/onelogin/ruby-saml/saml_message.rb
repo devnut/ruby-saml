@@ -4,7 +4,6 @@ require 'base64'
 require 'nokogiri'
 require 'rexml/document'
 require 'rexml/xpath'
-require 'thread'
 require "onelogin/ruby-saml/error_handling"
 
 # Only supports SAML 2.0
@@ -16,8 +15,8 @@ module OneLogin
     class SamlMessage
       include REXML
 
-      ASSERTION = "urn:oasis:names:tc:SAML:2.0:assertion"
-      PROTOCOL  = "urn:oasis:names:tc:SAML:2.0:protocol"
+      ASSERTION = "urn:oasis:names:tc:SAML:2.0:assertion".freeze
+      PROTOCOL  = "urn:oasis:names:tc:SAML:2.0:protocol".freeze
 
       BASE64_FORMAT = %r(\A([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\Z)
       @@mutex = Mutex.new
@@ -69,14 +68,14 @@ module OneLogin
           xml = Nokogiri::XML(document.to_s) do |config|
             config.options = XMLSecurity::BaseDocument::NOKOGIRI_OPTIONS
           end
-        rescue Exception => error
+        rescue StandardError => error
           return false if soft
           raise ValidationError.new("XML load failed: #{error.message}")
         end
 
         SamlMessage.schema.validate(xml).map do |schema_error|
           return false if soft
-          raise ValidationError.new("#{schema_error.message}\n\n#{xml.to_s}")
+          raise ValidationError.new("#{schema_error.message}\n\n#{xml}")
         end
       end
 
@@ -86,8 +85,13 @@ module OneLogin
       # @param saml [String] The deflated and encoded SAML Message
       # @return [String] The plain SAML Message
       #
-      def decode_raw_saml(saml)
+      def decode_raw_saml(saml, settings = nil)
         return saml unless base64_encoded?(saml)
+
+        settings = OneLogin::RubySaml::Settings.new if settings.nil?
+        if saml.bytesize > settings.message_max_bytesize
+          raise ValidationError.new("Encoded SAML Message exceeds " + settings.message_max_bytesize.to_s + " bytes, so was rejected")
+        end
 
         decoded = decode(saml)
         begin
@@ -105,7 +109,7 @@ module OneLogin
       def encode_raw_saml(saml, settings)
         saml = deflate(saml) if settings.compress_request
 
-        CGI.escape(Base64.encode64(saml))
+        CGI.escape(encode(saml))
       end
 
       # Base 64 decode method
@@ -121,7 +125,11 @@ module OneLogin
       # @return [String] The encoded string
       #
       def encode(string)
-        Base64.encode64(string).gsub(/\n/, "")
+        if Base64.respond_to?('strict_encode64')
+          Base64.strict_encode64(string)
+        else
+          Base64.encode64(string).gsub(/\n/, "")
+        end
       end
 
       # Check if a string is base64 encoded

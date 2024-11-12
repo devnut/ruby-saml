@@ -1,5 +1,10 @@
 require 'simplecov'
+require 'simplecov-lcov'
 
+SimpleCov::Formatter::LcovFormatter.config.report_with_single_file = true
+SimpleCov::Formatter::LcovFormatter.config.output_directory = 'coverage'
+SimpleCov::Formatter::LcovFormatter.config.lcov_file_name = 'lcov.info'
+SimpleCov.formatter = SimpleCov::Formatter::LcovFormatter
 SimpleCov.start do
   add_filter "test/"
   add_filter "vendor/"
@@ -12,6 +17,7 @@ require 'bundler'
 require 'minitest/autorun'
 require 'mocha/setup'
 require 'timecop'
+Dir[File.expand_path('../helpers/**/*.rb', __FILE__)].each { |f| require f }
 
 Bundler.require :default, :test
 
@@ -170,12 +176,24 @@ class Minitest::Test
     @idp_metadata_descriptor4 ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'idp_descriptor_4.xml'))
   end
 
+  def idp_metadata_descriptor5
+    @idp_metadata_descriptor5 ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'idp_descriptor_5.xml'))
+  end
+
+  def idp_metadata_descriptor6
+    @idp_metadata_descriptor6 ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'idp_descriptor_6.xml'))
+  end
+
   def no_idp_metadata_descriptor
     @no_idp_metadata_descriptor ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'no_idp_descriptor.xml'))
   end
 
   def idp_metadata_multiple_descriptors
     @idp_metadata_multiple_descriptors ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'idp_multiple_descriptors.xml'))
+  end
+
+  def idp_metadata_multiple_descriptors2
+    @idp_metadata_multiple_descriptors2 ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'idp_multiple_descriptors_2.xml'))
   end
 
   def idp_metadata_multiple_certs
@@ -194,6 +212,14 @@ class Minitest::Test
     @idp_metadata_different_sign_and_encrypt_cert ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'idp_metadata_different_sign_and_encrypt_cert.xml'))
   end
 
+  def idp_different_slo_response_location
+    @idp_different_slo_response_location ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'idp_different_slo_response_location.xml'))
+  end
+
+  def idp_without_slo_response_location
+    @idp_without_slo_response_location ||= File.read(File.join(File.dirname(__FILE__), 'metadata', 'idp_without_slo_response_location.xml'))
+  end
+
   def logout_request_document
     unless @logout_request_document
       xml = read_logout_request("slo_request.xml")
@@ -210,6 +236,15 @@ class Minitest::Test
       @logout_request_document_with_name_id_format = Base64.encode64(deflated)
     end
     @logout_request_document_with_name_id_format
+  end
+
+  def logout_request_encrypted_nameid_document
+    unless @logout_request_encrypted_nameid_document
+      xml = read_logout_request("slo_request_encrypted_nameid.xml")
+      deflated = Zlib::Deflate.deflate(xml, 9)[2..-5]
+      @logout_request_encrypted_nameid_document = Base64.encode64(deflated)
+    end
+    @logout_request_encrypted_nameid_document
   end
 
   def logout_request_xml_with_session_index
@@ -323,5 +358,10 @@ class Minitest::Test
         true
       end
     end
+  end
+
+  # Allows to emulate Azure AD request behavior
+  def downcased_escape(str)
+    CGI.escape(str).gsub(/%[A-Fa-f0-9]{2}/) { |match| match.downcase }
   end
 end

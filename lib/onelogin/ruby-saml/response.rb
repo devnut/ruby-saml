@@ -34,7 +34,7 @@ module OneLogin
       # This is not a whitelist to allow people extending OneLogin::RubySaml:Response
       # and pass custom options
       AVAILABLE_OPTIONS = [
-        :allowed_clock_drift, :check_duplicated_attributes, :matches_request_id, :settings, :skip_authnstatement, :skip_conditions,
+        :allowed_clock_drift, :check_duplicated_attributes, :matches_request_id, :settings, :skip_audience, :skip_authnstatement, :skip_conditions,
         :skip_destination, :skip_recipient_check, :skip_subject_confirmation
       ]
       # TODO: Update the comment on initialize to describe every option
@@ -47,6 +47,8 @@ module OneLogin
       #                          or :matches_request_id that will validate that the response matches the ID of the request,
       #                          or skip the subject confirmation validation with the :skip_subject_confirmation option
       #                          or skip the recipient validation of the subject confirmation element with :skip_recipient_check option
+      #                          or skip the audience validation with :skip_audience option
+      #
       def initialize(response, options = {})
         raise ArgumentError.new("Response cannot be nil") if response.nil?
 
@@ -61,7 +63,7 @@ module OneLogin
           end
         end
 
-        @response = decode_raw_saml(response)
+        @response = decode_raw_saml(response, settings)
         @document = XMLSecurity::SignedDocument.new(@response, @errors)
 
         if assertion_encrypted?
@@ -196,6 +198,27 @@ module OneLogin
         end
       end
 
+      # Gets the AuthnInstant from the AuthnStatement.
+      # Could be used to require re-authentication if a long time has passed
+      # since the last user authentication.
+      # @return [String] AuthnInstant value
+      #
+      def authn_instant
+        @authn_instant ||= begin
+          node = xpath_first_from_signed_assertion('/a:AuthnStatement')
+          node.nil? ? nil : node.attributes['AuthnInstant']
+        end
+      end
+
+      # Gets the AuthnContextClassRef from the AuthnStatement
+      # Could be used to require re-authentication if the assertion
+      # did not met the requested authentication context class.
+      # @return [String] AuthnContextClassRef value
+      #
+      def authn_context_class_ref
+        @authn_context_class_ref ||= Utils.element_text(xpath_first_from_signed_assertion('/a:AuthnStatement/a:AuthnContext/a:AuthnContextClassRef'))
+      end
+
       # Checks if the Status has the "Success" code
       # @return [Boolean] True if the StatusCode is Sucess
       #
@@ -225,11 +248,10 @@ module OneLogin
               statuses = nodes.collect do |inner_node|
                 inner_node.attributes["Value"]
               end
-              extra_code = statuses.join(" | ")
-              if extra_code
-                code = "#{code} | #{extra_code}"
-              end
+
+              code = [code, statuses].flatten.join(" | ")
             end
+
             code
           end
         end
@@ -336,9 +358,31 @@ module OneLogin
       end
 
       # returns the allowed clock drift on timing validation
-      # @return [Integer]
+      # @return [Float]
       def allowed_clock_drift
-        return options[:allowed_clock_drift] || 0
+        options[:allowed_clock_drift].to_f.abs + Float::EPSILON
+      end
+
+      # Checks if the SAML Response contains or not an EncryptedAssertion element
+      # @return [Boolean] True if the SAML Response contains an EncryptedAssertion element
+      #
+      def assertion_encrypted?
+        ! REXML::XPath.first(
+          document,
+          "(/p:Response/EncryptedAssertion/)|(/p:Response/a:EncryptedAssertion/)",
+          { "p" => PROTOCOL, "a" => ASSERTION }
+        ).nil?
+      end
+
+      def response_id
+        id(document)
+      end
+
+      def assertion_id
+        @assertion_id ||= begin
+          node = xpath_first_from_signed_assertion("")
+          node.nil? ? nil : node.attributes['ID']
+        end
       end
 
       private
@@ -353,7 +397,6 @@ module OneLogin
         return false unless validate_response_state
 
         validations = [
-          :validate_response_state,
           :validate_version,
           :validate_id,
           :validate_success_status,
@@ -435,7 +478,7 @@ module OneLogin
       # @return [Boolean] True if the SAML Response contains an ID, otherwise returns False
       #
       def validate_id
-        unless id(document)
+        unless response_id
           return append_error("Missing ID attribute on SAML Response")
         end
 
@@ -584,16 +627,23 @@ module OneLogin
       end
 
       # Validates the Audience, (If the Audience match the Service Provider EntityID)
+      # If the response was initialized with the :skip_audience option, this validation is skipped,
       # If fails, the error is added to the errors array
       # @return [Boolean] True if there is an Audience Element that match the Service Provider EntityID, otherwise False if soft=True
       # @raise [ValidationError] if soft == false and validation fails
       #
       def validate_audience
-        return true if audiences.empty? || settings.issuer.nil? || settings.issuer.empty?
+        return true if options[:skip_audience]
+        return true if settings.sp_entity_id.nil? || settings.sp_entity_id.empty?
 
-        unless audiences.include? settings.issuer
+        if audiences.empty?
+          return true unless settings.security[:strict_audience_validation]
+          return append_error("Invalid Audiences. The <AudienceRestriction> element contained only empty <Audience> elements. Expected audience #{settings.sp_entity_id}.")
+        end
+
+        unless audiences.include? settings.sp_entity_id
           s = audiences.count > 1 ? 's' : '';
-          error_msg = "Invalid Audience#{s}. The audience#{s} #{audiences.join(',')}, did not match the expected audience #{settings.issuer}"
+          error_msg = "Invalid Audience#{s}. The audience#{s} #{audiences.join(',')}, did not match the expected audience #{settings.sp_entity_id}"
           return append_error(error_msg)
         end
 
@@ -668,13 +718,13 @@ module OneLogin
 
         now = Time.now.utc
 
-        if not_before && (now_with_drift = now + allowed_clock_drift) < not_before
-          error_msg = "Current time is earlier than NotBefore condition (#{now_with_drift} < #{not_before})"
+        if not_before && now < (not_before - allowed_clock_drift)
+          error_msg = "Current time is earlier than NotBefore condition (#{now} < #{not_before}#{" - #{allowed_clock_drift.ceil}s" if allowed_clock_drift > 0})"
           return append_error(error_msg)
         end
 
-        if not_on_or_after && now >= (not_on_or_after_with_drift = not_on_or_after + allowed_clock_drift)
-          error_msg = "Current time is on or after NotOnOrAfter condition (#{now} >= #{not_on_or_after_with_drift})"
+        if not_on_or_after && now >= (not_on_or_after + allowed_clock_drift)
+          error_msg = "Current time is on or after NotOnOrAfter condition (#{now} >= #{not_on_or_after}#{" + #{allowed_clock_drift.ceil}s" if allowed_clock_drift > 0})"
           return append_error(error_msg)
         end
 
@@ -709,15 +759,15 @@ module OneLogin
       # this time validation is relaxed by the allowed_clock_drift value)
       # If fails, the error is added to the errors array
       # @param soft [Boolean] soft Enable or Disable the soft mode (In order to raise exceptions when the response is invalid or not)
-      # @return [Boolean] True if the SessionNotOnOrAfter of the AttributeStatement is valid, otherwise (when expired) False if soft=True
+      # @return [Boolean] True if the SessionNotOnOrAfter of the AuthnStatement is valid, otherwise (when expired) False if soft=True
       # @raise [ValidationError] if soft == false and validation fails
       #
-      def validate_session_expiration(soft = true)
+      def validate_session_expiration
         return true if session_expires_at.nil?
 
         now = Time.now.utc
-        unless (session_expires_at + allowed_clock_drift) > now
-          error_msg = "The attributes have expired, based on the SessionNotOnOrAfter of the AttributeStatement of this Response"
+        unless now < (session_expires_at + allowed_clock_drift)
+          error_msg = "The attributes have expired, based on the SessionNotOnOrAfter of the AuthnStatement of this Response"
           return append_error(error_msg)
         end
 
@@ -754,8 +804,8 @@ module OneLogin
 
           attrs = confirmation_data_node.attributes
           next if (attrs.include? "InResponseTo" and attrs['InResponseTo'] != in_response_to) ||
-                  (attrs.include? "NotOnOrAfter" and (parse_time(confirmation_data_node, "NotOnOrAfter") + allowed_clock_drift) <= now) ||
-                  (attrs.include? "NotBefore" and parse_time(confirmation_data_node, "NotBefore") > (now + allowed_clock_drift)) ||
+                  (attrs.include? "NotBefore" and now < (parse_time(confirmation_data_node, "NotBefore") - allowed_clock_drift)) ||
+                  (attrs.include? "NotOnOrAfter" and now >= (parse_time(confirmation_data_node, "NotOnOrAfter") + allowed_clock_drift)) ||
                   (attrs.include? "Recipient" and !options[:skip_recipient_check] and settings and attrs['Recipient'] != settings.assertion_consumer_service_url)
 
           valid_subject_confirmation = true
@@ -781,9 +831,9 @@ module OneLogin
             return append_error("An empty NameID value found")
           end
 
-          unless settings.issuer.nil? || settings.issuer.empty? || name_id_spnamequalifier.nil? || name_id_spnamequalifier.empty?
-            if name_id_spnamequalifier != settings.issuer
-              return append_error("The SPNameQualifier value mistmatch the SP entityID value.")
+          unless settings.sp_entity_id.nil? || settings.sp_entity_id.empty? || name_id_spnamequalifier.nil? || name_id_spnamequalifier.empty?
+            if name_id_spnamequalifier != settings.sp_entity_id
+              return append_error("SPNameQualifier value does not match the SP entityID value.")
             end
           end
         end
@@ -802,7 +852,7 @@ module OneLogin
         # otherwise, review if the decrypted assertion contains a signature
         sig_elements = REXML::XPath.match(
           document,
-          "/p:Response[@ID=$id]/ds:Signature]",
+          "/p:Response[@ID=$id]/ds:Signature",
           { "p" => PROTOCOL, "ds" => DSIG },
           { 'id' => document.signed_element_id }
         )
@@ -821,28 +871,59 @@ module OneLogin
         end
 
         if sig_elements.size != 1
+          if sig_elements.size == 0
+             append_error("Signed element id ##{doc.signed_element_id} is not found")
+          else
+             append_error("Signed element id ##{doc.signed_element_id} is found more than once")
+          end
           return append_error(error_msg)
         end
+
+        old_errors = @errors.clone
 
         idp_certs = settings.get_idp_cert_multi
         if idp_certs.nil? || idp_certs[:signing].empty?
           opts = {}
           opts[:fingerprint_alg] = settings.idp_cert_fingerprint_algorithm
-          opts[:cert] = settings.get_idp_cert
+          idp_cert = settings.get_idp_cert
           fingerprint = settings.get_fingerprint
+          opts[:cert] = idp_cert
 
-          unless fingerprint && doc.validate_document(fingerprint, @soft, opts)
+          if fingerprint && doc.validate_document(fingerprint, @soft, opts)
+            if settings.security[:check_idp_cert_expiration]
+              if OneLogin::RubySaml::Utils.is_cert_expired(idp_cert)
+                error_msg = "IdP x509 certificate expired"
+                return append_error(error_msg)
+              end
+            end
+          else
             return append_error(error_msg)
           end
         else
           valid = false
+          expired = false
           idp_certs[:signing].each do |idp_cert|
-            valid = doc.validate_document_with_cert(idp_cert)
+            valid = doc.validate_document_with_cert(idp_cert, true)
             if valid
+              if settings.security[:check_idp_cert_expiration]
+                if OneLogin::RubySaml::Utils.is_cert_expired(idp_cert)
+                  expired = true
+                end
+              end
+
+              # At least one certificate is valid, restore the old accumulated errors
+              @errors = old_errors
               break
             end
+
+          end
+          if expired
+            error_msg = "IdP x509 certificate expired"
+            return append_error(error_msg)
           end
           unless valid
+            # Remove duplicated errors
+            @errors = @errors.uniq
             return append_error(error_msg)
           end
         end
@@ -855,9 +936,9 @@ module OneLogin
           begin
             encrypted_node = xpath_first_from_signed_assertion('/a:Subject/a:EncryptedID')
             if encrypted_node
-              node = decrypt_nameid(encrypted_node)
+              decrypt_nameid(encrypted_node)
             else
-              node = xpath_first_from_signed_assertion('/a:Subject/a:NameID')
+              xpath_first_from_signed_assertion('/a:Subject/a:NameID')
             end
           end
       end
@@ -909,7 +990,7 @@ module OneLogin
       # @return [XMLSecurity::SignedDocument] The SAML Response with the assertion decrypted
       #
       def generate_decrypted_document
-        if settings.nil? || !settings.get_sp_key
+        if settings.nil? || settings.get_sp_decryption_keys.empty?
           raise ValidationError.new('An EncryptedAssertion found and no SP private key found on the settings to decrypt it. Be sure you provided the :settings parameter at the initialize method')
         end
 
@@ -943,17 +1024,6 @@ module OneLogin
         XMLSecurity::SignedDocument.new(response_node.to_s)
       end
 
-      # Checks if the SAML Response contains or not an EncryptedAssertion element
-      # @return [Boolean] True if the SAML Response contains an EncryptedAssertion element
-      #
-      def assertion_encrypted?
-        ! REXML::XPath.first(
-          document,
-          "(/p:Response/EncryptedAssertion/)|(/p:Response/a:EncryptedAssertion/)",
-          { "p" => PROTOCOL, "a" => ASSERTION }
-        ).nil?
-      end
-
       # Decrypts an EncryptedAssertion element
       # @param encrypted_assertion_node [REXML::Element] The EncryptedAssertion element
       # @return [REXML::Document] The decrypted EncryptedAssertion element
@@ -963,31 +1033,30 @@ module OneLogin
       end
 
       # Decrypts an EncryptedID element
-      # @param encryptedid_node [REXML::Element] The EncryptedID element
+      # @param encrypted_id_node [REXML::Element] The EncryptedID element
       # @return [REXML::Document] The decrypted EncrypedtID element
       #
-      def decrypt_nameid(encryptedid_node)
-        decrypt_element(encryptedid_node, /(.*<\/(\w+:)?NameID>)/m)
+      def decrypt_nameid(encrypted_id_node)
+        decrypt_element(encrypted_id_node, /(.*<\/(\w+:)?NameID>)/m)
       end
 
-      # Decrypts an EncryptedID element
-      # @param encryptedid_node [REXML::Element] The EncryptedID element
-      # @return [REXML::Document] The decrypted EncrypedtID element
+      # Decrypts an EncryptedAttribute element
+      # @param encrypted_attribute_node [REXML::Element] The EncryptedAttribute element
+      # @return [REXML::Document] The decrypted EncryptedAttribute element
       #
-      def decrypt_attribute(encryptedattribute_node)
-        decrypt_element(encryptedattribute_node, /(.*<\/(\w+:)?Attribute>)/m)
+      def decrypt_attribute(encrypted_attribute_node)
+        decrypt_element(encrypted_attribute_node, /(.*<\/(\w+:)?Attribute>)/m)
       end
 
       # Decrypt an element
-      # @param encryptedid_node [REXML::Element] The encrypted element
-      # @param rgrex string Regex
+      # @param encrypt_node [REXML::Element] The encrypted element
+      # @param regexp [Regexp] The regular expression to extract the decrypted data
       # @return [REXML::Document] The decrypted element
       #
-      def decrypt_element(encrypt_node, rgrex)
-        if settings.nil? || !settings.get_sp_key
+      def decrypt_element(encrypt_node, regexp)
+        if settings.nil? || settings.get_sp_decryption_keys.empty?
           raise ValidationError.new('An ' + encrypt_node.name + ' found and no SP private key found on the settings to decrypt it')
         end
-
 
         if encrypt_node.name == 'EncryptedAttribute'
           node_header = '<node xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
@@ -995,10 +1064,11 @@ module OneLogin
           node_header = '<node xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">'
         end
 
-        elem_plaintext = OneLogin::RubySaml::Utils.decrypt_data(encrypt_node, settings.get_sp_key)
+        elem_plaintext = OneLogin::RubySaml::Utils.decrypt_multi(encrypt_node, settings.get_sp_decryption_keys)
+
         # If we get some problematic noise in the plaintext after decrypting.
         # This quick regexp parse will grab only the Element and discard the noise.
-        elem_plaintext = elem_plaintext.match(rgrex)[0]
+        elem_plaintext = elem_plaintext.match(regexp)[0]
 
         # To avoid namespace errors if saml namespace is not defined
         # create a parent node first with the namespace defined

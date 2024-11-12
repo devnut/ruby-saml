@@ -79,7 +79,7 @@ module OneLogin
         self.class.single_value_compatibility ? single(canonize_name(name)) : multi(canonize_name(name))
       end
 
-      # @return [Array] Return all attributes as an array
+      # @return [Hash] Return all attributes as a hash
       #
       def all
         attributes
@@ -111,6 +111,29 @@ module OneLogin
         else
           super
         end
+      end
+
+      # Fetch attribute value using name or regex
+      # @param name [String|Regexp] The attribute name
+      # @return [String|Array] Depending on the single value compatibility status this returns:
+      #                        - First value if single_value_compatibility = true
+      #                          response.attributes['mail']  # => 'user@example.com'
+      #                        - All values if single_value_compatibility = false
+      #                          response.attributes['mail']  # => ['user@example.com','user@example.net']
+      #
+      def fetch(name)
+        attributes.each_key do |attribute_key|
+          if name.is_a?(Regexp)
+            if name.respond_to? :match?
+              return self[attribute_key] if name.match?(attribute_key)
+            else 
+              return self[attribute_key] if name.match(attribute_key)
+            end
+          elsif canonize_name(name) == canonize_name(attribute_key)
+            return self[attribute_key]
+          end
+        end
+        nil
       end
 
       protected

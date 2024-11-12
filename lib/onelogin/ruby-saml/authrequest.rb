@@ -3,6 +3,7 @@ require "rexml/document"
 require "onelogin/ruby-saml/logging"
 require "onelogin/ruby-saml/saml_message"
 require "onelogin/ruby-saml/utils"
+require "onelogin/ruby-saml/setting_error"
 
 # Only supports SAML 2.0
 module OneLogin
@@ -14,13 +15,17 @@ module OneLogin
     class Authrequest < SamlMessage
 
       # AuthNRequest ID
-      attr_reader :uuid
+      attr_accessor :uuid
 
       # Initializes the AuthNRequest. An Authrequest Object that is an extension of the SamlMessage class.
       # Asigns an ID, a random uuid.
       #
       def initialize
         @uuid = OneLogin::RubySaml::Utils.uuid
+      end
+
+      def request_id
+        @uuid
       end
 
       # Creates the AuthNRequest string.
@@ -30,14 +35,14 @@ module OneLogin
       #
       def create(settings, params = {})
         params = create_params(settings, params)
-        params_prefix = (settings.idp_sso_target_url =~ /\?/) ? '&' : '?'
+        params_prefix = (settings.idp_sso_service_url =~ /\?/) ? '&' : '?'
         saml_request = CGI.escape(params.delete("SAMLRequest"))
         request_params = "#{params_prefix}SAMLRequest=#{saml_request}"
         params.each_pair do |key, value|
-          request_params << "&#{key.to_s}=#{CGI.escape(value.to_s)}"
+          request_params << "&#{key}=#{CGI.escape(value.to_s)}"
         end
-        raise "Invalid settings, idp_sso_target_url is not set!" if settings.idp_sso_target_url.nil?
-        @login_url = settings.idp_sso_target_url + request_params
+        raise SettingError.new "Invalid settings, idp_sso_service_url is not set!" if settings.idp_sso_service_url.nil? or settings.idp_sso_service_url.empty?
+        @login_url = settings.idp_sso_service_url + request_params
       end
 
       # Creates the Get parameters for the request.
@@ -67,9 +72,10 @@ module OneLogin
         request = deflate(request) if settings.compress_request
         base64_request = encode(request)
         request_params = {"SAMLRequest" => base64_request}
+        sp_signing_key = settings.get_sp_signing_key
 
-        if settings.security[:authn_requests_signed] && !settings.security[:embed_sign] && settings.private_key
-          params['SigAlg']    = settings.security[:signature_method]
+        if settings.idp_sso_service_binding == Utils::BINDINGS[:redirect] && settings.security[:authn_requests_signed] && sp_signing_key
+          params['SigAlg'] = settings.security[:signature_method]
           url_string = OneLogin::RubySaml::Utils.build_query(
             :type => 'SAMLRequest',
             :data => base64_request,
@@ -77,7 +83,7 @@ module OneLogin
             :sig_alg => params['SigAlg']
           )
           sign_algorithm = XMLSecurity::BaseDocument.new.algorithm(settings.security[:signature_method])
-          signature = settings.get_sp_key.sign(sign_algorithm.new, url_string)
+          signature = sp_signing_key.sign(sign_algorithm.new, url_string)
           params['Signature'] = encode(signature)
         end
 
@@ -107,7 +113,7 @@ module OneLogin
         root.attributes['ID'] = uuid
         root.attributes['IssueInstant'] = time
         root.attributes['Version'] = "2.0"
-        root.attributes['Destination'] = settings.idp_sso_target_url unless settings.idp_sso_target_url.nil?
+        root.attributes['Destination'] = settings.idp_sso_service_url unless settings.idp_sso_service_url.nil? or settings.idp_sso_service_url.empty?
         root.attributes['IsPassive'] = settings.passive unless settings.passive.nil?
         root.attributes['ProtocolBinding'] = settings.protocol_binding unless settings.protocol_binding.nil?
         root.attributes["AttributeConsumingServiceIndex"] = settings.attributes_index unless settings.attributes_index.nil?
@@ -117,10 +123,22 @@ module OneLogin
         if settings.assertion_consumer_service_url != nil
           root.attributes["AssertionConsumerServiceURL"] = settings.assertion_consumer_service_url
         end
-        if settings.issuer != nil
+        if settings.sp_entity_id != nil
           issuer = root.add_element "saml:Issuer"
-          issuer.text = settings.issuer
+          issuer.text = settings.sp_entity_id
         end
+
+        if settings.name_identifier_value_requested != nil
+          subject = root.add_element "saml:Subject"
+
+          nameid = subject.add_element "saml:NameID"
+          nameid.attributes['Format'] = settings.name_identifier_format if settings.name_identifier_format
+          nameid.text = settings.name_identifier_value_requested
+
+          subject_confirmation = subject.add_element "saml:SubjectConfirmation"
+          subject_confirmation.attributes['Method'] = "urn:oasis:names:tc:SAML:2.0:cm:bearer"
+        end
+
         if settings.name_identifier_format != nil
           root.add_element "samlp:NameIDPolicy", {
               # Might want to make AllowCreate a setting?
@@ -162,16 +180,13 @@ module OneLogin
       end
 
       def sign_document(document, settings)
-        # embed signature
-        if settings.security[:authn_requests_signed] && settings.private_key && settings.certificate && settings.security[:embed_sign]
-          private_key = settings.get_sp_key
-          cert = settings.get_sp_cert
+        cert, private_key = settings.get_sp_signing_pair
+        if settings.idp_sso_service_binding == Utils::BINDINGS[:post] && settings.security[:authn_requests_signed] && private_key && cert
           document.sign_document(private_key, cert, settings.security[:signature_method], settings.security[:digest_method])
         end
 
         document
       end
-
     end
   end
 end

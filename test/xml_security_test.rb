@@ -236,10 +236,10 @@ class XmlSecurityTest < Minitest::Test
 
     describe "XMLSecurity::DSIG" do
       before do
-        settings.idp_sso_target_url = "https://idp.example.com/sso"
+        settings.idp_sso_service_url = "https://idp.example.com/sso"
         settings.protocol_binding = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
-        settings.idp_slo_target_url = "https://idp.example.com/slo",
-        settings.issuer = "https://sp.example.com/saml2"
+        settings.idp_slo_service_url = "https://idp.example.com/slo",
+        settings.sp_entity_id = "https://sp.example.com/saml2"
         settings.assertion_consumer_service_url = "https://sp.example.com/acs"
         settings.single_logout_service_url = "https://sp.example.com/sls"
       end
@@ -302,7 +302,7 @@ class XmlSecurityTest < Minitest::Test
       let (:response) { OneLogin::RubySaml::Response.new(fixture(:starfield_response)) }
 
       before do
-        response.settings = OneLogin::RubySaml::Settings.new( :idp_cert_fingerprint => "8D:BA:53:8E:A3:B6:F9:F1:69:6C:BB:D9:D8:BD:41:B3:AC:4F:9D:4D")
+        response.settings = OneLogin::RubySaml::Settings.new(:idp_cert_fingerprint => "8D:BA:53:8E:A3:B6:F9:F1:69:6C:BB:D9:D8:BD:41:B3:AC:4F:9D:4D")
       end
 
       it "be able to validate a good response" do
@@ -320,10 +320,10 @@ class XmlSecurityTest < Minitest::Test
           time_2 = 'Tue Nov 20 17:55:00 UTC 2012 < Wed Nov 28 17:53:45 UTC 2012'
 
           errors = [time_1, time_2].map do |time|
-            "Current time is earlier than NotBefore condition (#{time})"
+            "Current time is earlier than NotBefore condition (#{time} - 1s)"
           end
 
-          assert_predicate response.errors & errors, :any?
+          assert_predicate(response.errors & errors, :any?)
         end
       end
 
@@ -331,8 +331,8 @@ class XmlSecurityTest < Minitest::Test
         Timecop.freeze Time.parse('2012-11-30 17:55:00 UTC') do
           assert !response.is_valid?
 
-          contains_expected_error = response.errors.include? "Current time is on or after NotOnOrAfter condition (2012-11-30 17:55:00 UTC >= 2012-11-28 18:33:45 UTC)"
-          contains_expected_error ||= response.errors.include? "Current time is on or after NotOnOrAfter condition (Fri Nov 30 17:55:00 UTC 2012 >= Wed Nov 28 18:33:45 UTC 2012)"
+          contains_expected_error = response.errors.include?("Current time is on or after NotOnOrAfter condition (2012-11-30 17:55:00 UTC >= 2012-11-28 18:33:45 UTC + 1s)")
+          contains_expected_error ||= response.errors.include?("Current time is on or after NotOnOrAfter condition (Fri Nov 30 17:55:00 UTC 2012 >= Wed Nov 28 18:33:45 UTC 2012 + 1s)")
           assert contains_expected_error
         end
       end
@@ -395,13 +395,25 @@ class XmlSecurityTest < Minitest::Test
     end
 
     describe '#validate_document_with_cert' do
-      describe 'with valid document ' do
-        describe 'when response has cert' do
-          let(:document_data) { read_response('response_with_signed_message_and_assertion.xml') }
-          let(:document) { OneLogin::RubySaml::Response.new(document_data).document }
-          let(:idp_cert) { OpenSSL::X509::Certificate.new(ruby_saml_cert_text) }
-          let(:fingerprint) { '4b68c453c7d994aad9025c99d5efcf566287fe8d' }
+      let(:document_data) { read_response('response_with_signed_message_and_assertion.xml') }
+      let(:document) { OneLogin::RubySaml::Response.new(document_data).document }
+      let(:idp_cert) { OpenSSL::X509::Certificate.new(ruby_saml_cert_text) }
+      let(:fingerprint) { '4b68c453c7d994aad9025c99d5efcf566287fe8d' }
 
+      describe 'with invalid document ' do
+        describe 'when certificate is invalid' do
+          let(:document) { OneLogin::RubySaml::Response.new(document_data).document }
+
+          it 'is invalid' do
+            wrong_document_data = document_data.sub(/<ds:X509Certificate>.*<\/ds:X509Certificate>/, "<ds:X509Certificate>invalid<\/ds:X509Certificate>")
+            wrong_document = OneLogin::RubySaml::Response.new(wrong_document_data).document
+            refute wrong_document.validate_document_with_cert(idp_cert), 'Document should be invalid'
+          end
+        end
+      end
+
+      describe 'with valid document' do
+        describe 'when response has cert' do
           it 'is valid' do
             assert document.validate_document_with_cert(idp_cert), 'Document should be valid'
           end
@@ -414,6 +426,43 @@ class XmlSecurityTest < Minitest::Test
           it 'is valid' do
             assert document.validate_document_with_cert(idp_cert), 'Document should be valid'
           end
+        end
+      end
+
+      describe 'when response has no cert but you have local cert' do
+        let(:document_data) { response_document_valid_signed_without_x509certificate }
+
+        it 'is valid' do
+          assert document.validate_document_with_cert(idp_cert), 'Document should be valid'
+        end
+      end
+
+      describe 'when response cert is invalid' do
+        let(:document_data) do
+          contents = read_response('response_with_signed_message_and_assertion.xml')
+          contents.sub(/<ds:X509Certificate>.*<\/ds:X509Certificate>/,
+                       "<ds:X509Certificate>an-invalid-certificate</ds:X509Certificate>")
+        end
+
+        it 'is not valid' do
+          assert !document.validate_document_with_cert(idp_cert), 'Document should be valid'
+          assert_equal(["Document Certificate Error"], document.errors)
+        end
+      end
+
+      describe 'when response cert is different from idp cert' do
+        let(:idp_cert) { OpenSSL::X509::Certificate.new(ruby_saml_cert_text2) }
+
+        it 'is not valid' do
+          exception = assert_raises(OneLogin::RubySaml::ValidationError) do
+            document.validate_document_with_cert(idp_cert, false)
+          end
+          assert_equal("Certificate of the Signature element does not match provided certificate", exception.message)
+        end
+
+        it 'is not valid (soft = true)' do
+          document.validate_document_with_cert(idp_cert)
+          assert_equal(["Certificate of the Signature element does not match provided certificate"], document.errors)
         end
       end
     end

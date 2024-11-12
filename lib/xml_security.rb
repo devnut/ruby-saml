@@ -159,15 +159,13 @@ module XMLSecurity
       x509_cert_element.text = Base64.encode64(certificate.to_der).gsub(/\n/, "")
 
       # add the signature
-      issuer_element = self.elements["//saml:Issuer"]
+      issuer_element = elements["//saml:Issuer"]
       if issuer_element
-        self.root.insert_after issuer_element, signature_element
+        root.insert_after(issuer_element, signature_element)
+      elsif first_child = root.children[0]
+        root.insert_before(first_child, signature_element)
       else
-        if sp_sso_descriptor = self.elements["/md:EntityDescriptor"]
-          self.root.insert_before sp_sso_descriptor, signature_element
-        else
-          self.root.add_element(signature_element)
-        end
+        root.add_element(signature_element)
       end
     end
 
@@ -179,7 +177,7 @@ module XMLSecurity
 
     def compute_digest(document, digest_algorithm)
       digest = digest_algorithm.digest(document)
-      Base64.encode64(digest).strip!
+      Base64.encode64(digest).strip
     end
 
   end
@@ -212,19 +210,18 @@ module XMLSecurity
         begin
           cert = OpenSSL::X509::Certificate.new(cert_text)
         rescue OpenSSL::X509::CertificateError => _e
-          return append_error("Certificate Error", soft)
+          return append_error("Document Certificate Error", soft)
         end
 
         if options[:fingerprint_alg]
           fingerprint_alg = XMLSecurity::BaseDocument.new.algorithm(options[:fingerprint_alg]).new
         else
-          fingerprint_alg = OpenSSL::Digest::SHA1.new
+          fingerprint_alg = OpenSSL::Digest.new('SHA1')
         end
         fingerprint = fingerprint_alg.hexdigest(cert.to_der)
 
         # check cert matches registered idp cert
         if fingerprint != idp_cert_fingerprint.gsub(/[^a-zA-Z0-9]/,"").downcase
-          @errors << "Fingerprint mismatch"
           return append_error("Fingerprint mismatch", soft)
         end
       else
@@ -241,7 +238,7 @@ module XMLSecurity
       validate_signature(base64_cert, soft)
     end
 
-    def validate_document_with_cert(idp_cert)
+    def validate_document_with_cert(idp_cert, soft = true)
       # get cert from response
       cert_element = REXML::XPath.first(
         self,
@@ -255,12 +252,12 @@ module XMLSecurity
         begin
           cert = OpenSSL::X509::Certificate.new(cert_text)
         rescue OpenSSL::X509::CertificateError => _e
-          return append_error("Certificate Error", soft)
+          return append_error("Document Certificate Error", soft)
         end
 
         # check saml response cert matches provided idp cert
         if idp_cert.to_pem != cert.to_pem
-          return false
+          return append_error("Certificate of the Signature element does not match provided certificate", soft)
         end
       else
         base64_cert = Base64.encode64(idp_cert.to_pem)
@@ -313,36 +310,51 @@ module XMLSecurity
       canon_string = noko_signed_info_element.canonicalize(canon_algorithm)
       noko_sig_element.remove
 
+      # get signed info
+      signed_info_element = REXML::XPath.first(
+        sig_element,
+        "./ds:SignedInfo",
+        { "ds" => DSIG }
+      )
+
       # get inclusive namespaces
       inclusive_namespaces = extract_inclusive_namespaces
 
       # check digests
-      ref = REXML::XPath.first(sig_element, "//ds:Reference", {"ds"=>DSIG})
+      ref = REXML::XPath.first(signed_info_element, "./ds:Reference", {"ds"=>DSIG})
 
-      hashed_element = document.at_xpath("//*[@ID=$id]", nil, { 'id' => extract_signed_element_id })
+      reference_nodes = document.xpath("//*[@ID=$id]", nil, { 'id' => extract_signed_element_id })
+
+      if reference_nodes.length > 1 # ensures no elements with same ID to prevent signature wrapping attack.
+        return append_error("Digest mismatch. Duplicated ID found", soft)
+      end
+
+      hashed_element = reference_nodes[0]
 
       canon_algorithm = canon_algorithm REXML::XPath.first(
-        ref,
-        '//ds:CanonicalizationMethod',
+        signed_info_element,
+        './ds:CanonicalizationMethod',
         { "ds" => DSIG }
       )
+
+      canon_algorithm = process_transforms(ref, canon_algorithm)
+
       canon_hashed_element = hashed_element.canonicalize(canon_algorithm, inclusive_namespaces)
 
       digest_algorithm = algorithm(REXML::XPath.first(
         ref,
-        "//ds:DigestMethod",
+        "./ds:DigestMethod",
         { "ds" => DSIG }
       ))
       hash = digest_algorithm.digest(canon_hashed_element)
       encoded_digest_value = REXML::XPath.first(
         ref,
-        "//ds:DigestValue",
+        "./ds:DigestValue",
         { "ds" => DSIG }
       )
       digest_value = Base64.decode64(OneLogin::RubySaml::Utils.element_text(encoded_digest_value))
 
       unless digests_match?(hash, digest_value)
-        @errors << "Digest mismatch"
         return append_error("Digest mismatch", soft)
       end
 
@@ -359,6 +371,33 @@ module XMLSecurity
     end
 
     private
+
+    def process_transforms(ref, canon_algorithm)
+      transforms = REXML::XPath.match(
+        ref,
+        "./ds:Transforms/ds:Transform",
+        { "ds" => DSIG }
+      )
+
+      transforms.each do |transform_element|
+        if transform_element.attributes && transform_element.attributes["Algorithm"]
+          algorithm = transform_element.attributes["Algorithm"]
+          case algorithm
+            when "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+                 "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
+              canon_algorithm = Nokogiri::XML::XML_C14N_1_0
+            when "http://www.w3.org/2006/12/xml-c14n11",
+                 "http://www.w3.org/2006/12/xml-c14n11#WithComments"
+              canon_algorithm = Nokogiri::XML::XML_C14N_1_1
+            when "http://www.w3.org/2001/10/xml-exc-c14n#",
+                 "http://www.w3.org/2001/10/xml-exc-c14n#WithComments"
+              canon_algorithm = Nokogiri::XML::XML_C14N_EXCLUSIVE_1_0
+          end
+        end
+      end
+
+      canon_algorithm
+    end
 
     def digests_match?(hash, digest_value)
       hash == digest_value
